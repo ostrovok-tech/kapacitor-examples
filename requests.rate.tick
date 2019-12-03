@@ -1,0 +1,93 @@
+dbrp "supplier"."autogen"
+var name = 'requests.rate'
+var grafana_dash = 'pczpmYZWU/mydashboard'
+var grafana_panel = '26'
+var period = 8h
+var todayPeriod = 10m
+var every = 1m
+var warnAlert = 15
+var warnReset = 5
+var reqQuery = 'SELECT sum("count") AS value FROM "supplier"."autogen"."requests"'
+var errQuery = 'SELECT sum("count") AS value FROM "supplier"."autogen"."errors"'
+
+var prevErr = batch
+    |query(errQuery)
+        .period(period)
+        .every(every)
+        .groupBy(1m, 'channel', 'supplier')
+
+var prevReq = batch
+    |query(reqQuery)
+        .period(period)
+        .every(every)
+        .groupBy(1m, 'channel', 'supplier')
+
+var rates = prevReq
+    |join(prevErr)
+        .as('req', 'err')
+        .tolerance(1m)
+        .fill('null')
+    // заполняем значения нулями, если их не было
+    |default()
+        .field('err.value', 0.0)
+        .field('req.value', 0.0)
+    // if в lambda: считаем рейт, только если ошибки были
+    |eval(lambda: if("err.value" > 0, 100.0 * (float("req.value") - float("err.value")) / float("req.value"), 100.0))
+        .as('rate')
+
+// записываем посчитанные значения в инфлюкс
+rates
+    |influxDBOut()
+        .quiet()
+        .create()
+        .database('kapacitor')
+        .retentionPolicy('autogen')
+        .measurement('rates')
+
+// выбираем данные за последние 10 минут, считаем медиану
+var todayRate = rates
+    |where(lambda: duration((unixNano(now()) - unixNano("time")) / 1000, 1u) < todayPeriod)
+    |median('rate')
+        .as('median')
+
+var prevRate = rates
+    |median('rate')
+        .as('median')
+
+var joined = todayRate
+    |join(prevRate)
+        .as('today', 'prev')
+    |httpOut('join')
+
+var trigger = joined
+    |alert()
+        .warn(lambda: ("prev.median" - "today.median") > warnAlert)
+        .warnReset(lambda: ("prev.median" - "today.median") < warnReset)
+        .flapping(0.25, 0.5)
+        .stateChangesOnly()
+        // собираем в message ссылку на график дашборда графаны
+        .message(
+            '{{ .Level }}: {{ index .Tags "channel" }} err/req ratio ({{ index .Tags "supplier" }})
+{{ if eq .Level "OK" }}It is ok now{{ else }}
+'+string(todayPeriod)+' median is {{ index .Fields "today.median" | printf "%0.2f" }}%, by previous '+string(period)+' is {{ index .Fields "prev.median" | printf "%0.2f" }}%{{ end }}
+http://grafana.ostrovok.in/d/'+string(grafana_dash)+
+'?var-supplier={{ index .Tags "supplier" }}&var-channel={{ index .Tags "channel" }}&panelId='+string(grafana_panel)+'&fullscreen&tz=UTC%2B03%3A00'
+        )
+        .id('{{ index .Tags "name" }}/{{ index .Tags "channel" }}')
+        .levelTag('level')
+        .messageField('message')
+        .durationField('duration')
+        .topic('slack_graph')
+
+// "today.median" дублируем как "value", также пишем в инфлюкс остальные филды алерта (keep)
+trigger
+    |eval(lambda: "today.median")
+        .as('value')
+        .keep()
+    |influxDBOut()
+        .quiet()
+        .create()
+        .database('kapacitor')
+        .retentionPolicy('autogen')
+        .measurement('alerts')
+        .tag('alertName', name)
